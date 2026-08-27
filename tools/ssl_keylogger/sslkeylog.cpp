@@ -35,6 +35,8 @@ typedef WOLFSSL_SESSION SSL_SESSION;
 #include <stdlib.h>
 #include <stdio.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 #include <errno.h>
 #include <syslog.h>
 #include <pthread.h>
@@ -240,6 +242,17 @@ static int keylog_tcp_socket_open() {
 			keylog_tcp_socket_close();
 			return(0);
 		}
+		// Enable TCP keepalive so the kernel notices when VoipMonitor is torn
+		// down. Without this, writeBlock succeeds into a half-closed socket
+		// (CLOSE-WAIT), keys silently vanish, and no reconnect ever fires.
+		int fd = keylog_tcp_socket->getHandle();
+		if(fd >= 0) {
+			int on = 1, idle = 10, intvl = 5, cnt = 3;
+			setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+			setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+			setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+			setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+		}
 		debug_printf("OK connect to : %s:%i / %s", keylog_tcp_dest_host, keylog_tcp_dest_port, keylog_tcp_socket->getError().c_str());
 		keylog_tcp_socket->generate_rsa_keys(1024);
 		JsonExport json_rsa_key;
@@ -287,6 +300,22 @@ static void keylog_tcp_socket_write(u_char *data, size_t datalen) {
 	while(pass < max_pass) {
 		if(!keylog_tcp_socket) {
 			keylog_tcp_socket_open();
+		}
+		// Detect half-close (VoipMonitor sent FIN but shim never reads) before
+		// writing. A non-blocking MSG_PEEK returning 0 means the peer closed;
+		// writing more would silently fill a doomed send buffer.
+		if(keylog_tcp_socket) {
+			int fd = keylog_tcp_socket->getHandle();
+			if(fd >= 0) {
+				char probe;
+				ssize_t r = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+				if(r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+					debug_printf("keylog tcp socket half-closed (peek=%zd errno=%d), reopening", r, errno);
+					keylog_tcp_socket_close();
+					++pass;
+					continue;
+				}
+			}
 		}
 		if(keylog_tcp_socket && keylog_tcp_socket->writeBlock(data, datalen, cSocket::_te_aes)) {
 			ok = true;
