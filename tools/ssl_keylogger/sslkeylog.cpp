@@ -72,7 +72,9 @@ typedef WOLFSSL_SESSION SSL_SESSION;
 
 extern "C" {
 typedef SSL *(*SSL_new_type)(SSL_CTX *ctx);
-typedef void (*SSL_CTX_set_keylog_callback_type)(SSL_CTX *ctx, void (*)(const SSL *ssl, const char *line));
+typedef void (*SSL_keylog_callback_fn_type)(const SSL *ssl, const char *line);
+typedef void (*SSL_CTX_set_keylog_callback_type)(SSL_CTX *ctx, SSL_keylog_callback_fn_type);
+typedef SSL_keylog_callback_fn_type (*SSL_CTX_get_keylog_callback_type)(const SSL_CTX *ctx);
 typedef int (*SSL_connect_type)(SSL *ssl);
 typedef int (*SSL_do_handshake_type)(SSL *ssl);
 typedef int (*SSL_accept_type)(SSL *ssl);
@@ -126,6 +128,12 @@ volatile int key_queue_sync;
 extern "C" {
 static SSL_new_type SSL_new_orig;
 static SSL_CTX_set_keylog_callback_type SSL_CTX_set_keylog_callback_orig;
+static SSL_CTX_get_keylog_callback_type SSL_CTX_get_keylog_callback_orig;
+/* Callback already installed on an SSL_CTX before we hijacked it (e.g. kamailio's
+ * tls module installs ksr_tls_keylog_callback with its own TUPLE-emitting logic).
+ * Global rather than per-CTX because in practice a process has one CTX for the
+ * relevant traffic and we do not want to grow ex_data machinery here. */
+static SSL_keylog_callback_fn_type prior_keylog_callback;
 static SSL_connect_type SSL_connect_orig;
 static SSL_do_handshake_type SSL_do_handshake_orig;
 static SSL_accept_type SSL_accept_orig;
@@ -538,6 +546,14 @@ static void write_keylog(const SSL *ssl, const char *key) {
 	if(!ssl || !key) {
 		return;
 	}
+	/* Chain to any keylog callback the application installed before us
+	 * (e.g. kamailio's ksr_tls_keylog_callback, which emits "# TUPLE ..."
+	 * lines alongside the standard NSS key line). Without this call, the
+	 * app-level callback is silently dropped by our SSL_CTX_set_keylog_callback
+	 * override in SSL_new. */
+	if(prior_keylog_callback) {
+		prior_keylog_callback(ssl, key);
+	}
 	const char *keys_types[] = {
 		"CLIENT_RANDOM ",
 		"CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
@@ -607,9 +623,44 @@ wolfSSL_new
 #endif
 (SSL_CTX *ctx) {
 	if(SSL_CTX_set_keylog_callback_orig) {
+		/* Preserve any callback the application (e.g. kamailio's tls module)
+		 * already installed, so we can chain to it from write_keylog rather
+		 * than silently dropping its output. See prior_keylog_callback.
+		 *
+		 * Re-check on every SSL_new because kamailio uses multiple SSL_CTX
+		 * instances (one for the default TLS domain, plus any per-server-name
+		 * CTX from tls_server_name_cb). Only some of them will carry
+		 * ksr_tls_keylog_callback — grab whichever we see. Overwriting the
+		 * global here is acceptable: we only care that at least one CTX
+		 * points us at the app callback, and any CTX that has it points at
+		 * the same function pointer. */
+		if(SSL_CTX_get_keylog_callback_orig) {
+			SSL_keylog_callback_fn_type prev = SSL_CTX_get_keylog_callback_orig(ctx);
+			if(prev && prev != write_keylog) {
+				prior_keylog_callback = prev;
+			}
+		}
 		SSL_CTX_set_keylog_callback_orig(ctx, write_keylog);
 	}
 	return SSL_new_orig(ctx);
+}
+
+/* Intercept the app's own call to SSL_CTX_set_keylog_callback. Kamailio installs
+ * ksr_tls_keylog_callback at mod_init via this API; without this interposer, that
+ * call goes straight to libssl and the SSL_new hook above WOULD see it via
+ * SSL_CTX_get_keylog_callback — in theory. In practice the get_/set_ path via
+ * dlsym'd libssl symbols does not always round-trip the pointer (observed on
+ * OpenSSL 3.5 in trixie: SSL_CTX_get_keylog_callback returns NULL even after
+ * a fresh SSL_CTX_set_keylog_callback). This interposer captures the app
+ * callback directly at the call site, then forwards to our own write_keylog
+ * on the CTX so both the app callback and the shim run per key line. */
+extern "C" void SSL_CTX_set_keylog_callback(SSL_CTX *ctx, void (*cb)(const SSL *, const char *)) {
+	if(cb && cb != write_keylog) {
+		prior_keylog_callback = cb;
+	}
+	if(SSL_CTX_set_keylog_callback_orig) {
+		SSL_CTX_set_keylog_callback_orig(ctx, write_keylog);
+	}
 }
 
 #if not ONLY_KEYLOG_CALLBACK
@@ -751,6 +802,12 @@ __attribute__((constructor)) static void setup(void) {
 	SSL_CTX_set_keylog_callback_orig = (SSL_CTX_set_keylog_callback_type)lookup_symbol("SSL_CTX_set_keylog_callback", LIBSSL_SONAME);
 	if(SSL_CTX_set_keylog_callback_orig) {
 		debug_printf("OK detect pointer to function SSL_CTX_set_keylog_callback : 0x%lx", SSL_CTX_set_keylog_callback_orig);
+	}
+	/* Optional — for chaining to an app-installed callback (see prior_keylog_callback).
+	 * OpenSSL 1.1.1+ / wolfSSL. Missing on older libs is not fatal; we just cannot chain. */
+	SSL_CTX_get_keylog_callback_orig = (SSL_CTX_get_keylog_callback_type)lookup_symbol("SSL_CTX_get_keylog_callback", LIBSSL_SONAME);
+	if(SSL_CTX_get_keylog_callback_orig) {
+		debug_printf("OK detect pointer to function SSL_CTX_get_keylog_callback : 0x%lx", SSL_CTX_get_keylog_callback_orig);
 	}
 	#if ONLY_KEYLOG_CALLBACK
 	if(!SSL_CTX_set_keylog_callback_orig) {
